@@ -1,0 +1,3 @@
+# Image digest supplied dynamically by Jenkins CD pipeline
+image:
+  digest: ""

@@ -1,0 +1,240 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: '',
+            description: 'Previous working image tag to rollback to'
+        )
+    }
+
+    environment {
+        AWS_REGION    = 'us-east-1'
+        ECR_REGISTRY  = '717090908085.dkr.ecr.us-east-1.amazonaws.com'
+        ECR_REPO      = 'roboshop/user'
+
+        EKS_CLUSTER   = 'roboshop-dev-eks'
+        K8S_NAMESPACE = 'user'
+        HELM_RELEASE  = 'user'
+        HELM_CHART    = './helm'
+
+        KUBECONFIG    = "${WORKSPACE}/.kube/config"
+    }
+
+    stages {
+        stage('Validate Inputs') {
+            steps {
+                script {
+                    if (!(params.IMAGE_TAG ==~ /[0-9]+/)) {
+                        error('Valid previous IMAGE_TAG is required')
+                    }
+
+                    echo "Rollback Image Tag: ${params.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Get Image Digest') {
+            steps {
+                script {
+                    env.IMAGE_DIGEST = sh(
+                        script: '''
+                            aws ecr describe-images \
+                                --region "$AWS_REGION" \
+                                --repository-name "$ECR_REPO" \
+                                --image-ids imageTag="$IMAGE_TAG" \
+                                --query 'imageDetails[0].imageDigest' \
+                                --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    if (!(env.IMAGE_DIGEST ==~ /sha256:[a-f0-9]{64}/)) {
+                        error("Invalid image digest for tag: ${params.IMAGE_TAG}")
+                    }
+
+                    echo "Rollback Image Tag: ${params.IMAGE_TAG}"
+                    echo "Rollback Image Digest: ${env.IMAGE_DIGEST}"
+                }
+            }
+        }
+
+        stage('Update Kubeconfig') {
+            steps {
+                sh '''
+                    mkdir -p "$(dirname "$KUBECONFIG")"
+
+                    aws eks update-kubeconfig \
+                        --region "$AWS_REGION" \
+                        --name "$EKS_CLUSTER" \
+                        --kubeconfig "$KUBECONFIG"
+
+                    kubectl get nodes
+                '''
+            }
+        }
+
+        stage('Check Existing Release') {
+            steps {
+                sh '''
+                    helm status "$HELM_RELEASE" \
+                        -n "$K8S_NAMESPACE"
+
+                    echo "Current running image:"
+
+                    kubectl get deployment "$HELM_RELEASE" \
+                        -n "$K8S_NAMESPACE" \
+                        -o jsonpath='{.spec.template.spec.containers[0].image}'
+
+                    echo ""
+
+                    helm history "$HELM_RELEASE" \
+                        -n "$K8S_NAMESPACE"
+                '''
+            }
+        }
+
+        stage('Helm Lint') {
+            steps {
+                sh '''
+                    helm lint "$HELM_CHART" \
+                        --set-string image.digest="$IMAGE_DIGEST"
+                '''
+            }
+        }
+
+        stage('Helm Template') {
+            steps {
+                sh '''
+                    helm template "$HELM_RELEASE" "$HELM_CHART" \
+                        --namespace "$K8S_NAMESPACE" \
+                        --set-string image.digest="$IMAGE_DIGEST"
+                '''
+            }
+        }
+
+        stage('Rollback Deployment') {
+            steps {
+                sh '''
+                    helm upgrade "$HELM_RELEASE" "$HELM_CHART" \
+                        --namespace "$K8S_NAMESPACE" \
+                        --set-string image.digest="$IMAGE_DIGEST" \
+                        --atomic \
+                        --wait \
+                        --timeout 5m
+                '''
+            }
+        }
+
+        stage('Verify Rollback') {
+            steps {
+                sh '''
+                    kubectl rollout status \
+                        deployment/"$HELM_RELEASE" \
+                        -n "$K8S_NAMESPACE" \
+                        --timeout=300s
+
+                    echo "-----------------------------"
+                    echo "Running Pods"
+                    echo "-----------------------------"
+
+                    kubectl get pods \
+                        -n "$K8S_NAMESPACE" -o wide
+
+                    echo "-----------------------------"
+                    echo "Services"
+                    echo "-----------------------------"
+
+                    kubectl get svc -n "$K8S_NAMESPACE"
+
+                    echo "-----------------------------"
+                    echo "External Secret"
+                    echo "-----------------------------"
+
+                    kubectl wait \
+                        --for=condition=Ready \
+                        externalsecret/user-external-secret \
+                        -n "$K8S_NAMESPACE" \
+                        --timeout=120s
+
+                    kubectl get externalsecret \
+                        -n "$K8S_NAMESPACE"
+
+                    echo "-----------------------------"
+                    echo "Kubernetes Secret"
+                    echo "-----------------------------"
+
+                    kubectl get secret user-secret \
+                        -n "$K8S_NAMESPACE"
+
+                    echo "-----------------------------"
+                    echo "Running Image"
+                    echo "-----------------------------"
+
+                    RUNNING_IMAGE=$(kubectl get deployment \
+                        "$HELM_RELEASE" \
+                        -n "$K8S_NAMESPACE" \
+                        -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+                    EXPECTED_IMAGE="${ECR_REGISTRY}/${ECR_REPO}@${IMAGE_DIGEST}"
+
+                    echo "Running Image:  $RUNNING_IMAGE"
+                    echo "Expected Image: $EXPECTED_IMAGE"
+
+                    if [ "$RUNNING_IMAGE" != "$EXPECTED_IMAGE" ]; then
+                        echo "ERROR: Rollback image mismatch"
+                        exit 1
+                    fi
+
+                    echo "Rollback image verified successfully"
+
+                    echo "-----------------------------"
+                    echo "Helm Status"
+                    echo "-----------------------------"
+
+                    helm status "$HELM_RELEASE" \
+                        -n "$K8S_NAMESPACE"
+
+                    echo "-----------------------------"
+                    echo "Helm History"
+                    echo "-----------------------------"
+
+                    helm history "$HELM_RELEASE" \
+                        -n "$K8S_NAMESPACE"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'User rollback completed successfully'
+            echo 'Environment: dev'
+            echo "Image Tag: ${params.IMAGE_TAG}"
+            echo "Image Digest: ${env.IMAGE_DIGEST}"
+        }
+
+        failure {
+            echo 'User rollback failed'
+        }
+    }
+}
