@@ -1,0 +1,220 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: '',
+            description: 'Docker image tag from CI'
+        )
+
+        string(
+            name: 'IMAGE_DIGEST',
+            defaultValue: '',
+            description: 'Docker image digest from CI'
+        )
+
+        string(
+            name: 'GIT_COMMIT_SHA',
+            defaultValue: '',
+            description: 'Git commit SHA from CI'
+        )
+    }
+
+    environment {
+        AWS_REGION     = 'us-east-1'
+        ECR_REGISTRY   = '717090908085.dkr.ecr.us-east-1.amazonaws.com'
+        ECR_REPO       = 'roboshop/user'
+
+        EKS_CLUSTER    = 'roboshop-dev-eks'
+        K8S_NAMESPACE  = 'user'
+        HELM_RELEASE   = 'user'
+        HELM_CHART     = './helm'
+
+        KUBECONFIG     = "${WORKSPACE}/.kube/config"
+
+        IMAGE_TAG      = "${params.IMAGE_TAG}"
+        IMAGE_DIGEST   = "${params.IMAGE_DIGEST}"
+        GIT_COMMIT_SHA = "${params.GIT_COMMIT_SHA}"
+    }
+
+    stages {
+        stage('Validate Inputs') {
+            steps {
+                script {
+                    if (!(params.IMAGE_TAG ==~ /[0-9]+/)) {
+                        error('Valid IMAGE_TAG is required')
+                    }
+
+                    if (!(params.IMAGE_DIGEST ==~ /sha256:[a-f0-9]{64}/)) {
+                        error('Valid IMAGE_DIGEST is required')
+                    }
+
+                    if (!(params.GIT_COMMIT_SHA ==~ /[a-f0-9]{40}/)) {
+                        error('Valid GIT_COMMIT_SHA is required')
+                    }
+
+                    echo "Image Tag: ${params.IMAGE_TAG}"
+                    echo "Image Digest: ${params.IMAGE_DIGEST}"
+                    echo "Git Commit SHA: ${params.GIT_COMMIT_SHA}"
+                }
+            }
+        }
+
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+
+                sh '''
+                    git checkout --detach "$GIT_COMMIT_SHA"
+
+                    echo "Deploying Git commit:"
+                    git rev-parse HEAD
+                '''
+            }
+        }
+
+        stage('Verify Image Digest') {
+            steps {
+                sh '''
+                    ACTUAL_DIGEST=$(aws ecr describe-images \
+                        --region "$AWS_REGION" \
+                        --repository-name "$ECR_REPO" \
+                        --image-ids imageTag="$IMAGE_TAG" \
+                        --query 'imageDetails[0].imageDigest' \
+                        --output text)
+
+                    if [ "$ACTUAL_DIGEST" != "$IMAGE_DIGEST" ]; then
+                        echo "ERROR: Image digest mismatch"
+                        exit 1
+                    fi
+
+                    echo "Image digest verified successfully"
+                '''
+            }
+        }
+
+        stage('Update Kubeconfig') {
+            steps {
+                sh '''
+                    mkdir -p "$(dirname "$KUBECONFIG")"
+
+                    aws eks update-kubeconfig \
+                        --region "$AWS_REGION" \
+                        --name "$EKS_CLUSTER" \
+                        --kubeconfig "$KUBECONFIG"
+
+                    kubectl get nodes
+                '''
+            }
+        }
+
+        stage('Helm Lint') {
+            steps {
+                sh '''
+                    helm lint "$HELM_CHART" \
+                        --set-string image.digest="$IMAGE_DIGEST"
+                '''
+            }
+        }
+
+        stage('Helm Template') {
+            steps {
+                sh '''
+                    helm template "$HELM_RELEASE" "$HELM_CHART" \
+                        --namespace "$K8S_NAMESPACE" \
+                        --set-string image.digest="$IMAGE_DIGEST"
+                '''
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh '''
+                    helm upgrade --install \
+                        "$HELM_RELEASE" "$HELM_CHART" \
+                        --namespace "$K8S_NAMESPACE" \
+                        --create-namespace \
+                        --set-string image.digest="$IMAGE_DIGEST" \
+                        --wait \
+                        --timeout 5m
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                    kubectl rollout status \
+                        deployment/"$HELM_RELEASE" \
+                        -n "$K8S_NAMESPACE" \
+                        --timeout=300s
+
+                    kubectl get pods -n "$K8S_NAMESPACE" -o wide
+
+                    kubectl get svc -n "$K8S_NAMESPACE"
+
+                    kubectl wait \
+                        --for=condition=Ready \
+                        externalsecret/user-external-secret \
+                        -n "$K8S_NAMESPACE" \
+                        --timeout=120s
+
+                    kubectl get externalsecret -n "$K8S_NAMESPACE"
+
+                    kubectl get secret user-secret \
+                        -n "$K8S_NAMESPACE"
+
+                    echo "Running image:"
+
+                    RUNNING_IMAGE=$(kubectl get deployment \
+                        "$HELM_RELEASE" \
+                        -n "$K8S_NAMESPACE" \
+                        -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+                    EXPECTED_IMAGE="${ECR_REGISTRY}/${ECR_REPO}@${IMAGE_DIGEST}"
+
+                    echo "$RUNNING_IMAGE"
+
+                    if [ "$RUNNING_IMAGE" != "$EXPECTED_IMAGE" ]; then
+                        echo "ERROR: Deployed image mismatch"
+                        exit 1
+                    fi
+
+                    echo "Deployed image verified successfully"
+
+                    helm status "$HELM_RELEASE" \
+                        -n "$K8S_NAMESPACE"
+
+                    helm history "$HELM_RELEASE" \
+                        -n "$K8S_NAMESPACE"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'User CD completed successfully'
+            echo "Image Tag: ${params.IMAGE_TAG}"
+            echo "Image Digest: ${params.IMAGE_DIGEST}"
+            echo "Git Commit SHA: ${params.GIT_COMMIT_SHA}"
+        }
+
+        failure {
+            echo 'User CD failed'
+        }
+    }
+}
